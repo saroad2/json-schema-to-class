@@ -10,6 +10,7 @@ class Config:
     indent: int = 4
     line_break: str = '\n'
     generate_repr_method: bool = False
+    validate: bool = False
 
 
 def spaces(level: int):
@@ -25,8 +26,9 @@ def indent_class(code: str, level: int):
 
 
 class Item:
-    def __init__(self, name: str):
+    def __init__(self, name: str, schema: Dict[Any, Any]):
         self.name = name
+        self.schema = schema
 
     def class_name(self):
         return self.name.title().replace('_', '')
@@ -57,8 +59,14 @@ class Basic(Item):
         'boolean': bool
     }
 
-    def __init__(self, name: str, typename: type, default: Any = None):
-        super().__init__(name=name)
+    def __init__(
+            self,
+            name: str,
+            typename: type,
+            schema: Dict[str, Any],
+            default: Any = None,
+    ):
+        super().__init__(name=name, schema=schema)
         self.type = typename
         self.default = default
 
@@ -76,8 +84,8 @@ class Basic(Item):
 
 
 class Definition(Item):
-    def __init__(self, name: str, class_type: str, path: str):
-        super().__init__(name=name)
+    def __init__(self, name: str, class_type: str, path: str, schema: Dict[str, Any]):
+        super().__init__(name=name, schema=schema)
         self.path = path
         self.class_type = class_type
 
@@ -95,8 +103,8 @@ class Definition(Item):
 
 
 class Model(Item):
-    def __init__(self, name: str, default: Any = None):
-        super().__init__(name=name)
+    def __init__(self, name: str, schema: Any, default: Any = None):
+        super().__init__(name=name, schema=schema)
         self.properties: List[Item] = []
         self.default = default or {}
 
@@ -106,6 +114,14 @@ class Model(Item):
     def inner_models(self) -> List['Model']:
         return [item for item in self.properties if item.is_inner_model() and isinstance(item, Model)]
 
+    def to_schema_code(self):
+        schema_json = json.dumps(self.schema, indent=2)
+        return Config.line_break.join(
+            [f'{spaces(1)}SCHEMA = json.loads("""'] +
+            [f"{spaces(2)}{line}" for line in schema_json.split(Config.line_break)] +
+            [f'{spaces(1)}""")']
+        )
+
     def to_init_code(self):
         return f'{spaces(2)}self.{self.name} = self.{self.class_name()}(values=values.get("{self.name}"))'
 
@@ -114,10 +130,16 @@ class Model(Item):
 
     def to_class_code(self, level: int = 0) -> str:
         result = [f'class {self.class_name()}:']
+        if Config.validate:
+            result.append(self.to_schema_code())
         for item in self.inner_models():
             result.append(item.to_class_code(level=1))
             result.append('')
         result.append(f'{spaces(1)}def __init__(self, values: dict = None):')
+        if Config.validate:
+            result.append(
+                f"{spaces(2)}validate(instance=values, schema={self.class_name()}.SCHEMA)"
+            )
         result.append(f'{spaces(2)}values = values if values is not None else {repr(self.default)}')
         result.append(Config.line_break.join(item.to_init_code() for item in self.properties))
         if Config.generate_repr_method:
@@ -133,8 +155,14 @@ class Model(Item):
 class Array(Model):
     use_list = False
 
-    def __init__(self, name: str, items: Item = None, default: Any = None):
-        super().__init__(name=name)
+    def __init__(
+            self,
+            name: str,
+            schema: Dict[str, Any],
+            items: Item = None,
+            default: Any = None,
+    ):
+        super().__init__(name=name, schema=schema)
         self.items = items
         self.properties.append(items)
         self.default = default
@@ -178,7 +206,7 @@ class Parser:
         self.root: Optional[Item] = None
 
     def parse_object(self, name: str, schema: dict) -> Model:
-        model = Model(name=name)
+        model = Model(name=name, schema=schema)
         for name, definition in schema.get('properties', {}).items():
             item = self.parse_definition(name=name, schema=definition)
             model.properties.append(item)
@@ -186,7 +214,9 @@ class Parser:
 
     def parse_array(self, name: str, schema: dict) -> Array:
         items = self.parse_definition('items', schema['items'])
-        return Array(name=name, items=items, default=schema.get('default', None))
+        return Array(
+            name=name, schema=schema, items=items, default=schema.get('default', None)
+        )
 
     def parse_definition(self, name: str, schema: dict) -> Item:
         default = schema.get('default', None)
@@ -198,18 +228,33 @@ class Parser:
             elif item_type == 'array':
                 return self.parse_array(name=name, schema=schema)
             else:
-                return Basic(name=name, typename=Basic.TYPE_MAP[item_type], default=default)
+                return Basic(
+                    name=name,
+                    schema=schema,
+                    typename=Basic.TYPE_MAP[item_type],
+                    default=default
+                )
         elif 'enum' in schema:
             enum_list = schema['enum']
             assert len(enum_list) > 0, "Enum List is Empty"
             first = enum_list[0]
             assert all(type(first) == type(item) for item in enum_list), "Items in Enum List with Different Types"
             assert type(first) in {int, float, str}, "Enum Type is not int, float or string"
-            return Basic(name=name, typename=type(first), default=default)
+            return Basic(
+                name=name,
+                schema=schema,
+                typename=type(first),
+                default=default
+            )
         elif '$ref' in schema:
             path: str = schema['$ref']
             class_type = path.split('/')[-1]
-            return Definition(name=name, class_type=class_type, path=path)
+            return Definition(
+                name=name,
+                schema=schema,
+                class_type=class_type,
+                path=path
+            )
         else:
             raise ValueError(f'Cannot parse schema {repr(schema)}')
 
@@ -230,8 +275,14 @@ class Parser:
             result.append('')
         result.append(self.root.to_class_code(level=0))
 
+        imports = []
         if Array.use_list:
-            result = ['from typing import List', '', ''] + result
+            imports.append('from typing import List')
+        if Config.validate:
+            imports.append("import json")
+            imports.append("from jsonschema import validate")
+        if len(imports) != 0:
+            result = imports + ['', ''] + result
         return Config.line_break.join(result) + Config.line_break
 
 
@@ -269,10 +320,12 @@ def main():  # pragma: no cover
     arg_parser.add_argument('-o', '--output-path', type=str, default=None)
     arg_parser.add_argument('-i', '--indent', type=int, default=4)
     arg_parser.add_argument('--repr', action='store_true', help='generate __repr__ method', default=False)
+    arg_parser.add_argument('--validate', action='store_true', help='add schema valdiation', default=False)
 
     arguments = arg_parser.parse_args()
     Config.indent = arguments.indent
     Config.generate_repr_method = arguments.repr
+    Config.validate = arguments.validate
 
     if arguments.output_path is None:
         print(generate_code(arguments.schema_path))
